@@ -260,4 +260,53 @@ describe('weather-theme', () => {
     expect(await title()).toBe('Precipitation now')
     await ui.unmount()
   })
+
+  test('a partial forecast plays its own frames, even after a later failure', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12, 25) })
+    let curls = 0
+    let failFrom = 3
+    on('process.run', async (_$, e) => {
+      if (e.argv[0] !== 'curl') return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      const ok = curls++ < failFrom
+      return { value: { exitCode: ok ? 0 : 22, stdout: ok ? '200' : '500', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    let running = weather($, 'play precip')
+    await clock.advance(5000)
+    expect((await running).text).toContain('Playing the next 6 hours')
+    await weather($, 'stop')
+
+    // An hour later every download fails: still the same 3 frames, never 9.
+    // In steps: the pane's 300 ms animation ticker runs meanwhile.
+    for (let i = 0; i < 6; i++) await clock.advance(10 * 60 * 1000)
+    curls = 0
+    failFrom = 0
+    running = weather($, 'play precip')
+    await clock.advance(5000)
+    expect((await running).text).toContain('Playing the next 6 hours')
+  })
+
+  test('stopping while frames load cancels the play', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
+    on('process.run', async () => ({ value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    const running = weather($, 'play wind')
+    await clock.advance(1000)
+    await weather($, 'stop')
+    await clock.advance(9000)
+    expect((await running).text).toBe('Playback was cancelled.')
+
+    const ui = await $.ui.mount({ plugin: 'weather-theme', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Button', key: 'play' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /^Wind speed/ }))?.text).toBe('Wind speed now')
+    await ui.unmount()
+  })
 })

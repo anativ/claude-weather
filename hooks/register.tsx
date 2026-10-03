@@ -226,13 +226,31 @@ async function downloadTile($: $, url: string, path: string): Promise<string | n
   return moved.exitCode === 0 ? null : 'Could not save a map tile.'
 }
 
-// Downloads a layer's tiles when they are stale, then decodes them into the
-// map. A failed download is retried after TILE_RETRY_MS, not every check.
+// One download at a time, maps and forecasts alike: the flag is taken before
+// the first await, and a layer asked for meanwhile loads once it is free.
 async function loadMap($: $, field: Field, force = false): Promise<string> {
   if (isFetchingTiles) {
     pendingField = field
     return 'Fetching another map first; this one follows.'
   }
+  isFetchingTiles = true
+  try {
+    return await fetchMap($, field, force)
+  } finally {
+    isFetchingTiles = false
+    await loadPending($, field)
+  }
+}
+
+async function loadPending($: $, done: Field) {
+  const next = pendingField
+  pendingField = undefined
+  if (next && next !== done && (await read($, view)) === next) await loadMap($, next)
+}
+
+// Downloads a layer's tiles when they are stale, then decodes them into the
+// map. A failed download is retried after TILE_RETRY_MS, not every check.
+async function fetchMap($: $, field: Field, force: boolean): Promise<string> {
   const now = await $.clock.now()
   const key = await apiKey($)
   const stamps = ((await $.store.get('tilesAt')) ?? {}) as Partial<Record<Field, number>>
@@ -242,7 +260,6 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
   const isBackingOff = !force && now - (failures[field] ?? 0) < TILE_RETRY_MS
   if ((isFresh || isBackingOff) && maps.has(field)) return 'Map is up to date.'
 
-  isFetchingTiles = true
   let error: string | null = null
   try {
     if (!isFresh && !isBackingOff) {
@@ -286,14 +303,9 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
       maps.set(field, { plain: compose(field, tiles) })
     }
   } finally {
-    isFetchingTiles = false
     await update($, mapError, () => error)
     await update($, mapVersion, n => n + 1)
   }
-
-  const next = pendingField
-  pendingField = undefined
-  if (next && next !== field && (await read($, view)) === next) await loadMap($, next)
   return error ?? `${layerOf(field).title} map updated.`
 }
 
@@ -312,25 +324,39 @@ async function animPath($: $, field: Field, k: number): Promise<string> {
   return `${home}/.cache/claude-weather/forecast/${field}-${k}.png`
 }
 
-// Downloads the layer's keyframes when the cached ones are stale, then
-// decodes and composites them. Plays whatever unbroken run loaded.
 async function loadAnimation($: $, field: Field): Promise<string | null> {
   if (isFetchingTiles) return 'Fetching a map; try again in a moment.'
+  isFetchingTiles = true
+  try {
+    return await fetchAnimation($, field)
+  } finally {
+    isFetchingTiles = false
+    await loadPending($, field)
+  }
+}
+
+// Which forecast the files on disk hold: its first hour, how many leading
+// frames belong to it, and when it was fetched (0 after a partial download,
+// so the next play tries again).
+type ForecastStamp = { at: number; base: number; usable?: number }
+
+// Downloads the layer's keyframes when the cached ones are stale, then
+// decodes and composites them. Plays whatever unbroken run loaded, and
+// never a mix of two forecasts.
+async function fetchAnimation($: $, field: Field): Promise<string | null> {
   const now = await $.clock.now()
   const key = await apiKey($)
-  const stamps = ((await $.store.get('forecastAt')) ?? {}) as Partial<Record<Field, { at: number; base: number }>>
+  const stamps = ((await $.store.get('forecastAt')) ?? {}) as Partial<Record<Field, ForecastStamp>>
   const maxAge = key ? TILE_MAX_AGE_MS.keyed : TILE_MAX_AGE_MS.keyless
   const stamp = stamps[field]
   const isFresh = stamp !== undefined && now - stamp.at < maxAge
   if (isFresh && animations.get(field)?.base === stamp.base) return null
 
-  isFetchingTiles = true
   let error: string | null = null
   try {
     let base = stamp?.base ?? 0
-    // How many keyframes on disk belong to `base`; a partial download
-    // plays only the frames it fetched, never a mix of two forecasts.
-    let usable = KEYFRAMES
+    // Stamps from before `usable` was kept were written only after a full download.
+    let usable = stamp ? (stamp.usable ?? KEYFRAMES) : 0
     if (!isFresh) {
       const fresh = Math.floor(now / HOUR_MS) * HOUR_MS
       const auth = key ? `?apikey=${encodeURIComponent(key)}` : ''
@@ -351,8 +377,9 @@ async function loadAnimation($: $, field: Field): Promise<string | null> {
       if (downloaded > 0) {
         base = fresh
         usable = downloaded
+        const next: ForecastStamp = { at: error ? 0 : now, base, usable }
+        await $.store.set('forecastAt', { ...stamps, [field]: next })
       }
-      if (!error) await $.store.set('forecastAt', { ...stamps, [field]: { at: now, base } })
     }
 
     const frames: Uint8Array[] = []
@@ -367,9 +394,12 @@ async function loadAnimation($: $, field: Field): Promise<string | null> {
       }
     }
     if (frames.length < 2) error ??= 'No forecast frames yet.'
-    else animations.set(field, { base, frames, pixels: new Map(), cells: new Map() })
+    else {
+      // Only the layer being played is kept: nine frames are ~5 MB.
+      animations.clear()
+      animations.set(field, { base, frames, pixels: new Map(), cells: new Map() })
+    }
   } finally {
-    isFetchingTiles = false
     await update($, playStatus, () => error)
   }
   return error
@@ -386,7 +416,7 @@ function lastHour(field: Field): number {
 
 // The map `hour` hours ahead, blended between the keyframes either side.
 function frameAt(anim: Animation, hour: number): Uint8Array {
-  const k = Math.floor(hour / STEP_HOURS)
+  const k = Math.min(Math.floor(hour / STEP_HOURS), anim.frames.length - 1)
   const t = (hour % STEP_HOURS) / STEP_HOURS
   const a = anim.frames[k]!
   const b = anim.frames[k + 1]
@@ -400,13 +430,20 @@ async function advancePlay($: $) {
   await update($, playHour, () => Math.min(playTicks, lastHour(current)))
 }
 
+// Bumped by every play and stop, so a play whose frames are still loading
+// gives way to whatever the person did meanwhile.
+let playRequest = 0
+
 async function startPlay($: $, field: Field): Promise<string> {
-  stopTimer()
+  const request = ++playRequest
   await update($, view, () => field)
   const error = await loadAnimation($, field)
   if (frames(field) < 2) return error ?? 'No forecast frames.'
+  if (request !== playRequest || (await read($, view)) !== field) return 'Playback was cancelled.'
   playTicks = Math.min(await read($, playHour), lastHour(field))
+  await update($, playHour, () => playTicks)
   await update($, isPlaying, () => true)
+  stopTimer()
   playTimer = $.clock.every(PLAY_TICK_MS, () => void advancePlay($))
   const playing = `Playing the next ${lastHour(field)} hours of ${layerOf(field).title.toLowerCase()}.`
   return error ? `${playing} (${error})` : playing
@@ -418,6 +455,7 @@ function stopTimer() {
 }
 
 async function stopPlay($: $) {
+  playRequest += 1
   stopTimer()
   await update($, isPlaying, () => false)
 }
@@ -549,7 +587,7 @@ export const register: Register = on => {
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) {
       stopTicker()
-      stopTimer()
+      await stopPlay($)
     }
     return next(e)
   })
@@ -682,7 +720,7 @@ export const register: Register = on => {
         let cellsB64: () => string
         if (anim && isForecast) {
           const cache = (store: Map<string, string>, key: string, make: () => string) => {
-            if (store.size > 60) store.clear()
+            if (store.size > HOURS + 1) store.clear()
             let value = store.get(key)
             if (value === undefined) store.set(key, (value = make()))
             return value
