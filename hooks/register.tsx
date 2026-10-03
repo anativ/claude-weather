@@ -11,6 +11,12 @@ const API = 'https://api.tomorrow.io/v4/timelines'
 const FIELDS = 'temperature,temperatureApparent,humidity,windSpeed,weatherCode'
 const MIN_REFRESH_MS = 30 * 60 * 1000
 const DAILY_BUDGET = { keyless: 150, keyed: 400 }
+// Hard caps, a little under Tomorrow.io's, over every session's requests.
+const HOUR_CAP = { keyless: 45, keyed: 22 }
+const DAY_CAP = { keyless: 190, keyed: 480 }
+const HOUR_MS = 60 * 60 * 1000
+const DAY_MS = 24 * HOUR_MS
+const MAX_CITIES = 12
 const CHECK_MS = 60 * 1000
 const REQUEST_GAP_MS = 600
 const TICK_MS = 300
@@ -56,6 +62,20 @@ function refreshMs(cityCount: number, hasKey: boolean): number {
   return Math.max(MIN_REFRESH_MS, Math.ceil((cityCount * 24 * 60 * 60 * 1000) / budget))
 }
 
+// Timestamps of the last day's requests, shared by every session through
+// $.store, so forced refreshes and parallel sessions stay under the caps.
+async function takeRequest($: $, now: number, hasKey: boolean): Promise<string | null> {
+  const stored = await $.store.get('requests')
+  const log = (Array.isArray(stored) ? (stored as number[]) : []).filter(t => now - t < DAY_MS)
+  const tier = hasKey ? 'keyed' : 'keyless'
+  if (log.length >= DAY_CAP[tier]) return 'Daily request budget used; showing last readings.'
+  if (log.filter(t => now - t < HOUR_MS).length >= HOUR_CAP[tier]) {
+    return 'Hourly request budget used; showing last readings.'
+  }
+  await $.store.set('requests', [...log, now])
+  return null
+}
+
 function featuredIndex(n: number, tick: number, shift: number): number {
   if (n === 0) return 0
   return (((Math.floor(tick / TICKS_PER_CITY) + shift) % n) + n) % n
@@ -63,9 +83,9 @@ function featuredIndex(n: number, tick: number, shift: number): number {
 
 let isRefreshing = false
 
-// Fetches every city, keeping the last good reading for any that fail.
-// The cache lives in $.store so every session shares one quota.
-async function refresh($: $, force = false): Promise<string> {
+// Fetches every city (or just `only`), keeping the last good reading for
+// any that fail. The cache lives in $.store so every session shares it.
+async function refresh($: $, force = false, only?: string): Promise<string> {
   if (isRefreshing) return 'Already refreshing.'
   const cached = (await $.store.get('snapshot')) as Snapshot | undefined
   const now = await $.clock.now()
@@ -75,14 +95,24 @@ async function refresh($: $, force = false): Promise<string> {
     await update($, snapshot, () => cached)
     return 'Using cached weather.'
   }
+  // Another session is mid-refresh; its result lands in the shared cache.
+  const busyUntil = Number((await $.store.get('refreshingUntil')) ?? 0)
+  if (busyUntil > now) return 'Another session is refreshing.'
 
+  const targets = only ? list.filter(c => c.label === only) : list
   isRefreshing = true
+  await $.store.set('refreshingUntil', now + targets.length * (REQUEST_GAP_MS + 10_000))
   try {
     const previous = new Map((cached?.cities ?? []).map(c => [c.label, c]))
     const results: CityWeather[] = []
     let error: string | null = null
 
-    for (const [i, city] of list.entries()) {
+    for (const [i, city] of targets.entries()) {
+      const overBudget = await takeRequest($, now, Boolean(key))
+      if (overBudget) {
+        error = overBudget
+        break
+      }
       if (i > 0) await wait($, REQUEST_GAP_MS)
       const auth = key ? `&apikey=${encodeURIComponent(key)}` : ''
       const url = `${API}?location=${encodeURIComponent(city.query)}&fields=${FIELDS}&timesteps=current&units=metric${auth}`
@@ -108,7 +138,9 @@ async function refresh($: $, force = false): Promise<string> {
           fetchedAt: now,
         })
       } catch (err) {
-        error = `${city.label}: ${err instanceof Error ? err.message : String(err)}`
+        const message = err instanceof Error ? err.message : String(err)
+        // The key rides in the URL; keep it off the screen if an error echoes it.
+        error = `${city.label}: ${key ? message.split(key).join('***') : message}`
       }
     }
 
@@ -118,12 +150,13 @@ async function refresh($: $, force = false): Promise<string> {
       .map(c => (fetched.has(c.label) ? results.find(r => r.label === c.label) : previous.get(c.label)))
       .filter((c): c is CityWeather => c !== undefined)
 
-    const next: Snapshot = { cities: merged, fetchedAt: now, error }
+    const next: Snapshot = { cities: merged, fetchedAt: only ? (cached?.fetchedAt ?? now) : now, error }
     await $.store.set('snapshot', next)
     await update($, snapshot, () => next)
     return error ?? `Fetched weather for ${results.length} cities.`
   } finally {
     isRefreshing = false
+    await $.store.delete('refreshingUntil')
   }
 }
 
@@ -229,18 +262,24 @@ export const register: Register = on => {
         if (list.some(c => c.label.toLowerCase() === label.toLowerCase())) {
           return { text: `${label} is already on the list.` }
         }
+        if (list.length >= MAX_CITIES) {
+          return { text: `Up to ${MAX_CITIES} cities fit the free rate limits; remove one first.` }
+        }
         await $.store.set('cities', [...list, { query: arg, label }])
-        return { text: `Added ${label}. ${await refresh($, true)}` }
+        return { text: `Added ${label}. ${await refresh($, true, label)}` }
       }
       case 'remove': {
         const list = await cities($)
         const kept = list.filter(c => c.label.toLowerCase() !== arg.toLowerCase())
         if (kept.length === list.length) return { text: `No city named "${arg}".` }
         await $.store.set('cities', kept)
-        await update($, snapshot, s => ({
+        const drop = (s: Snapshot): Snapshot => ({
           ...s,
           cities: s.cities.filter(c => c.label.toLowerCase() !== arg.toLowerCase()),
-        }))
+        })
+        const cached = (await $.store.get('snapshot')) as Snapshot | undefined
+        if (cached) await $.store.set('snapshot', drop(cached))
+        await update($, snapshot, drop)
         return { text: `Removed ${arg}.` }
       }
       case 'list':

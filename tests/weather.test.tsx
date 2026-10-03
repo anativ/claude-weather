@@ -75,4 +75,49 @@ describe('weather-theme', () => {
     expect(await ui.find({ type: 'Text', text: 'Cloudy' })).toBeDefined()
     await ui.unmount()
   })
+
+  test('the shared hourly cap stops a forced refresh', async ($, on) => {
+    const now = Date.UTC(2026, 9, 3, 12)
+    mock.store(on, { requests: Array.from({ length: 45 }, (_, i) => now - i * 1000) })
+    mock.env(on, {})
+    mock.clock(on, { now })
+    let calls = 0
+    on('http.fetch', async () => {
+      calls += 1
+      return { value: { status: 200, ok: true, headers: {}, text: reading(1000, 20) } }
+    })
+    const ran = await $.command.run({ command: 'weather', args: 'refresh' })
+    expect(ran.text).toContain('Hourly request budget used')
+    expect(calls).toBe(0)
+  })
+
+  test('add fetches only the new city; remove drops it from the cache', async ($, on) => {
+    // A store of the test's own, so it can read what the plugin wrote.
+    const store = new Map<string, unknown>([['cities', [{ query: 'paris', label: 'Paris' }]]])
+    on('store.get', async (_$, e) => ({ value: store.get(e.key) }))
+    on('store.set', async (_$, e) => {
+      store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+      return { value: undefined }
+    })
+    on('store.delete', async (_$, e) => {
+      store.delete(e.key)
+      return { value: undefined }
+    })
+    const cached = () => (store.get('snapshot') as { cities: { label: string }[] }).cities.map(c => c.label)
+    mock.env(on, {})
+    mock.clock(on)
+    const urls: string[] = []
+    on('http.fetch', async (_$, e) => {
+      urls.push(e.url)
+      return { value: { status: 200, ok: true, headers: {}, text: reading(1000, 20) } }
+    })
+    await $.command.run({ command: 'weather', args: 'add oslo' })
+    expect(urls.length).toBe(1)
+    expect(urls[0]).toContain('location=oslo')
+
+    expect(cached()).toContain('Oslo')
+
+    await $.command.run({ command: 'weather', args: 'remove oslo' })
+    expect(cached()).not.toContain('Oslo')
+  })
 })

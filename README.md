@@ -45,8 +45,11 @@ answers anonymous requests at 2/second, 50/hour, 200/day. A free key
 (`/weather key <KEY>` or `TOMORROW_IO_API_KEY`) raises that to 500/day.
 
 The refresh interval spreads a daily budget (150 requests keyless, 400 with a
-key) across the cities, never faster than every 30 minutes. Readings are
-cached across sessions, so opening more sessions doesn't spend more quota.
+key) across the cities, never faster than every 30 minutes. Every request is
+also logged in the plugin's store and checked against hard hourly and daily
+caps shared by all sessions, so forced refreshes (`/weather refresh`, `r`)
+can't blow through the limit. `/weather add` fetches only the new city, and
+the list holds up to 12 cities. Readings are cached across sessions.
 
 ## Layout
 
