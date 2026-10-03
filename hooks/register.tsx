@@ -1,8 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { City, CityWeather, Snapshot } from '../types'
+import type { City, CityWeather, Snapshot, View } from '../types'
 import { HEIGHT, WIDTH, describe, scene, tempColor } from './art'
+import { MAP_HEIGHT, MAP_WIDTH, TILES, ZOOM, cityPixel, compose, toCells, withMarkers } from './map'
+import type { Field } from './map'
+import { fromBase64, toBase64 } from './base64'
+import { decodePng } from './png'
+import type { Decoded } from './png'
 
 const PANE = 'weather'
 // /timelines answers without a key too (2/second, 50/hour, 200/day);
@@ -10,7 +15,9 @@ const PANE = 'weather'
 const API = 'https://api.tomorrow.io/v4/timelines'
 const FIELDS = 'temperature,temperatureApparent,humidity,windSpeed,weatherCode'
 const MIN_REFRESH_MS = 30 * 60 * 1000
-const DAILY_BUDGET = { keyless: 150, keyed: 400 }
+// Cities take most of the day's budget; map tiles (4 a layer) the rest.
+const DAILY_BUDGET = { keyless: 110, keyed: 400 }
+const TILE_MAX_AGE_MS = { keyless: 3 * 60 * 60 * 1000, keyed: 60 * 60 * 1000 }
 // Hard caps, a little under Tomorrow.io's, over every session's requests.
 const HOUR_CAP = { keyless: 45, keyed: 22 }
 const DAY_CAP = { keyless: 190, keyed: 480 }
@@ -38,6 +45,15 @@ const EMPTY: Snapshot = { cities: [], fetchedAt: 0, error: null }
 const snapshot = atom({ plugin: 'weather-theme', key: 'snapshot' } as const, EMPTY)
 const frame = atom({ plugin: 'weather-theme', key: 'frame' } as const, 0)
 const offset = atom({ plugin: 'weather-theme', key: 'offset' } as const, 0)
+const view = atom({ plugin: 'weather-theme', key: 'view' } as const, 'cities' as View)
+const mapVersion = atom({ plugin: 'weather-theme', key: 'mapVersion' } as const, 0)
+const mapError = atom({ plugin: 'weather-theme', key: 'mapError' } as const, null as string | null)
+const pixels = atom({ plugin: 'weather-theme', key: 'pixels' } as const, false)
+
+const MAP_TITLES: Record<Field, string> = {
+  temperature: 'Temperature now',
+  precipitationIntensity: 'Precipitation now',
+}
 
 type $ = EngineInterface
 
@@ -160,6 +176,100 @@ async function refresh($: $, force = false, only?: string): Promise<string> {
   }
 }
 
+// Maps, built from tiles on disk; the module's own, rebuilt after a reload.
+type MapImage = { plain: Uint8Array; marked?: { key: string; b64: string }; cells?: { key: string; b64: string } }
+const maps = new Map<Field, MapImage>()
+let isFetchingTiles = false
+
+async function tilePath($: $, field: Field, x: number, y: number): Promise<string> {
+  const home = (await $.env.get('HOME')) ?? '/tmp'
+  return `${home}/.cache/claude-weather/${field}-${ZOOM}-${x}-${y}.png`
+}
+
+async function cityPixels($: $): Promise<[number, number][]> {
+  return (await cities($)).map(c => cityPixel(c.query)).filter((p): p is [number, number] => p !== undefined)
+}
+
+// Downloads a layer's tiles when they are stale (curl, since $.http.fetch
+// answers text and tiles are PNG bytes), then decodes them into the map.
+async function loadMap($: $, field: Field, force = false): Promise<string> {
+  if (isFetchingTiles) return 'Already fetching map tiles.'
+  const now = await $.clock.now()
+  const key = await apiKey($)
+  const stamps = ((await $.store.get('tilesAt')) ?? {}) as Partial<Record<Field, number>>
+  const maxAge = key ? TILE_MAX_AGE_MS.keyed : TILE_MAX_AGE_MS.keyless
+  const isFresh = !force && now - (stamps[field] ?? 0) < maxAge
+  if (isFresh && maps.has(field)) return 'Map is up to date.'
+
+  isFetchingTiles = true
+  let error: string | null = null
+  try {
+    if (!isFresh) {
+      for (const [i, [x, y]] of TILES.entries()) {
+        const overBudget = await takeRequest($, now, Boolean(key))
+        if (overBudget) {
+          error = overBudget
+          break
+        }
+        if (i > 0) await wait($, REQUEST_GAP_MS)
+        const auth = key ? `?apikey=${encodeURIComponent(key)}` : ''
+        const url = `https://api.tomorrow.io/v4/map/tile/${ZOOM}/${x}/${y}/${field}/now.png${auth}`
+        const path = await tilePath($, field, x, y)
+        const run = await $.process.run(
+          ['curl', '-s', '-f', '--create-dirs', '-w', '%{http_code}', '-o', path, url],
+          { timeoutMs: 20_000 },
+        )
+        if (run.exitCode !== 0) {
+          const status = run.stdout.trim()
+          error =
+            status === '429'
+              ? 'Tomorrow.io rate limit hit; showing the last map.'
+              : status === '401' || status === '403'
+                ? 'Tomorrow.io rejected the API key.'
+                : `Map tile download failed (HTTP ${status || '–'}, curl ${run.exitCode}).`
+          break
+        }
+      }
+      if (!error) await $.store.set('tilesAt', { ...stamps, [field]: now })
+    }
+
+    const tiles = new Map<string, Decoded>()
+    for (const [x, y] of TILES) {
+      try {
+        const { base64 } = await $.fs.read(await tilePath($, field, x, y), { as: 'bytes' })
+        tiles.set(`${x},${y}`, decodePng(fromBase64(base64)))
+      } catch {
+        // A tile never downloaded leaves its quarter as bare land and sea.
+      }
+    }
+    if (tiles.size === 0) {
+      error ??= 'No map tiles yet.'
+    } else {
+      maps.set(field, { plain: compose(field, tiles) })
+    }
+  } finally {
+    isFetchingTiles = false
+    await update($, mapError, () => error)
+    await update($, mapVersion, n => n + 1)
+  }
+  return error ?? `${MAP_TITLES[field]} map updated.`
+}
+
+async function showView($: $, next: View) {
+  await update($, view, () => next)
+  if (next !== 'cities') await loadMap($, next)
+}
+
+async function togglePixels($: $) {
+  await update($, pixels, p => !p)
+}
+
+async function refreshView($: $) {
+  const current = await read($, view)
+  if (current === 'cities') await refresh($, true)
+  else await loadMap($, current, true)
+}
+
 function fmt(n: number | undefined, digits = 0): string {
   return n === undefined || Number.isNaN(n) ? '–' : n.toFixed(digits)
 }
@@ -182,6 +292,8 @@ const HELP = [
   '/weather list            list cities',
   '/weather reset           back to the default cities',
   '/weather refresh         fetch now (uses API quota)',
+  '/weather temp | precip   show the world temperature or precipitation map',
+  '/weather cities          back to the city view',
 ].join('\n')
 
 let ticker: { cancel: () => void } | undefined
@@ -217,18 +329,29 @@ async function openPane($: $) {
 }
 
 async function start($: $) {
+  // Ghostty, kitty and WezTerm draw real pixels; others get half-blocks.
+  const term = ((await $.env.get('TERM_PROGRAM')) ?? '').toLowerCase()
+  await update($, pixels, () => ['ghostty', 'kitty', 'wezterm'].includes(term))
+  const current = await read($, view)
+  if (current !== 'cities') await loadMap($, current)
   await refresh($)
   await setStatus($)
+}
+
+async function check($: $) {
+  await refresh($)
+  const current = await read($, view)
+  if (current !== 'cities') await loadMap($, current)
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'weather',
-      description: 'Weather around the world: open the pane, or key/add/remove/list/reset/refresh',
+      description: 'Weather around the world: open the pane, temp/precip maps, or key/add/remove/list/reset/refresh',
     })
     void start($)
-    $.clock.every(CHECK_MS, () => void refresh($))
+    $.clock.every(CHECK_MS, () => void check($))
     void openPane($)
 
     return next(e)
@@ -289,6 +412,21 @@ export const register: Register = on => {
         return { text: `Back to the default cities. ${await refresh($, true)}` }
       case 'refresh':
         return { text: await refresh($, true) }
+      case 'temp':
+      case 'temperature':
+      case 'precip':
+      case 'precipitation':
+      case 'rain':
+      case 'map': {
+        const field: Field = sub.startsWith('temp') || sub === 'map' ? 'temperature' : 'precipitationIntensity'
+        await openPane($)
+        await update($, view, () => field)
+        return { text: await loadMap($, field) }
+      }
+      case 'cities':
+        await update($, view, () => 'cities')
+        await openPane($)
+        return { text: 'City view.' }
       default:
         return { text: HELP }
     }
@@ -296,6 +434,92 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const current = await read($, view)
+
+    const tabs = (
+      <Box>
+        {(
+          [
+            ['cities', 'cities', '1'],
+            ['temperature', 'temp', '2'],
+            ['precipitationIntensity', 'precip', '3'],
+          ] as const
+        ).map(([id, label, hotkey]) => (
+          <Box marginRight={1}>
+            <Button
+              key={`view-${id}`}
+              label={label}
+              hotkey={hotkey}
+              variant={current === id ? 'primary' : 'secondary'}
+              onPress={() => void showView($, id)}
+            />
+          </Box>
+        ))}
+        <Button key="refresh" label="refresh" hotkey="r" onPress={() => void refreshView($)} />
+      </Box>
+    )
+
+    if (current !== 'cities') {
+      await read($, mapVersion)
+      const error = await read($, mapError)
+      const usePixels = await read($, pixels)
+      const image = maps.get(current)
+      const columns = Math.max(20, Math.min(e.props.bodyColumns, 160))
+      const rows = Math.max(5, Math.round((columns * MAP_HEIGHT) / MAP_WIDTH / 2))
+      const stamps = ((await $.store.get('tilesAt')) ?? {}) as Partial<Record<Field, number>>
+      const markers = await cityPixels($)
+      const markerKey = JSON.stringify(markers)
+
+      let picture = <Text dimColor>{error ?? `Loading ${MAP_TITLES[current].toLowerCase()} map…`}</Text>
+      if (image && e.surface !== 'terminal') {
+        picture = <Text dimColor>Maps draw in the terminal.</Text>
+      } else if (image && e.surface === 'terminal') {
+        const { Image, Raster } = $.ui.resolve(e)
+        if (usePixels) {
+          if (image.marked?.key !== markerKey) {
+            image.marked = { key: markerKey, b64: toBase64(withMarkers(image.plain, markers)) }
+          }
+          picture = (
+            <Image
+              source={{ rgba: image.marked.b64, width: MAP_WIDTH, height: MAP_HEIGHT }}
+              columns={columns}
+              rows={rows}
+              alt={`${MAP_TITLES[current]} (this terminal shows no images: press b for blocks)`}
+            />
+          )
+        } else {
+          const key = `${columns}x${rows}:${markerKey}`
+          if (image.cells?.key !== key) image.cells = { key, b64: toCells(image.plain, columns, rows, markers) }
+          picture = <Raster key="map" columns={columns} rows={rows} cells={image.cells.b64} />
+        }
+      }
+
+      const legend: [string, string][] =
+        current === 'temperature'
+          ? [['#3c64c8', '■'], ['#3cc8c8', '■'], ['#50c850', '■'], ['#f0d040', '■'], ['#e05030', '■']]
+          : [['#9fe0e0', '■'], ['#40c000', '■'], ['#f0e000', '■'], ['#f08000', '■'], ['#e02020', '■']]
+
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text bold>{MAP_TITLES[current]}</Text>
+          {picture}
+          <Box>
+            <Text dimColor>{current === 'temperature' ? 'cold ' : 'light '}</Text>
+            {legend.map(([color, glyph]) => (
+              <Text color={color}>{glyph}</Text>
+            ))}
+            <Text dimColor>{current === 'temperature' ? ' hot' : ' heavy'}</Text>
+            <Text dimColor> · tiles {clock(stamps[current] ?? 0)} · © Tomorrow.io, Natural Earth </Text>
+            {e.surface === 'terminal' && (
+              <Button key="pixels" label={usePixels ? 'blocks' : 'pixels'} hotkey="b" onPress={() => void togglePixels($)} />
+            )}
+          </Box>
+          {image && error && <Text color="#ff875f">{error}</Text>}
+        </Box>
+      )
+    }
+
     const snap = await read($, snapshot)
     const tick = await read($, frame)
     const shift = await read($, offset)
@@ -305,6 +529,7 @@ export const register: Register = on => {
     if (list.length === 0) {
       return (
         <Box flexDirection="column">
+          {tabs}
           <Text color="#ffd75f">{snap.error ?? 'Fetching weather from Tomorrow.io…'}</Text>
           <Text dimColor>/weather help for commands</Text>
         </Box>
@@ -343,21 +568,20 @@ export const register: Register = on => {
         <Text dimColor>
           {index + 1}/{list.length} · updated {clock(snap.fetchedAt)}
         </Text>
+        <Box marginTop={1}>
+          <Button key="prev" label="◀" hotkey="p" onPress={() => update($, offset, n => n - 1)} />
+          <Text> </Text>
+          <Button key="next" label="▶" hotkey="n" onPress={() => update($, offset, n => n + 1)} />
+        </Box>
       </Box>
     )
 
     return (
       <Box flexDirection="column">
+        {tabs}
         <Box flexDirection={wide ? 'row' : 'column'}>
           {picture}
           {details}
-        </Box>
-        <Box>
-          <Button key="prev" label="◀" hotkey="p" onPress={() => update($, offset, n => n - 1)} />
-          <Text> </Text>
-          <Button key="next" label="▶" hotkey="n" onPress={() => update($, offset, n => n + 1)} />
-          <Text> </Text>
-          <Button key="refresh" label="refresh" hotkey="r" onPress={() => void refresh($, true)} />
         </Box>
         <Text dimColor>{'─'.repeat(Math.max(10, Math.min(e.props.bodyColumns, 56)))}</Text>
         {list.map((c, i) => {

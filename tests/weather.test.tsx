@@ -1,4 +1,20 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+
+import { fromBase64, toBase64 } from '../hooks/base64'
+import { decodePng } from '../hooks/png'
+
+// A 256x256 solid red RGB PNG, rows Sub-filtered, as Tomorrow.io tiles are shaped.
+const RED_TILE = 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAACAUlEQVR42u3TQQ0AAAjEMM4N/lUgizcaaCUsWaa74KsYAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAGMAAGAAMAAYAA4ABwABgADAAGAAMAAYAA4ABwABgADAAGAAMAAYAA4ABwABgADAAGAAMAAYAA4ABwABgADAAGAAMAAYAA4ABwABgADAAGAAMAAYAA4ABwABgADAAGAAMAAbAAGAAMAAYAAwABgADgAHAAGAAMAAYAAwABgADgAHAAGAAMAAYAAwABgADgAHAAGAAMAAYAAwABgADgAHAAGAAMAAYAAwABgADgAHAAGAAMAAYAAwABgADgAHAAGAAMAAGMAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAATCAChgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAC4FtJ0GRB4aAORAAAAAElFTkSuQmCC'
+
+function weather($: Engine, args: string) {
+  return $.command.run({
+    command: 'weather',
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+}
 
 const PANE = {
   component: 'Pane',
@@ -36,7 +52,7 @@ describe('weather-theme', () => {
     })
 
     // Requests are spaced to respect the free plan's 3/second limit.
-    const running = $.command.run({ command: 'weather', args: 'refresh' })
+    const running = weather($, 'refresh')
     await clock.advance(1000)
     const ran = await running
     expect(ran.text).toContain('Fetched weather for 2 cities')
@@ -66,7 +82,7 @@ describe('weather-theme', () => {
       urls.push(e.url)
       return { value: { status: 200, ok: true, headers: {}, text: reading(1001, 10.6) } }
     })
-    const ran = await $.command.run({ command: 'weather', args: 'refresh' })
+    const ran = await weather($, 'refresh')
     expect(ran.text).toContain('Fetched weather for 1 cities')
     expect(urls[0]).toContain('/v4/timelines?location=paris')
     expect(urls[0]).not.toContain('apikey')
@@ -86,7 +102,7 @@ describe('weather-theme', () => {
       calls += 1
       return { value: { status: 200, ok: true, headers: {}, text: reading(1000, 20) } }
     })
-    const ran = await $.command.run({ command: 'weather', args: 'refresh' })
+    const ran = await weather($, 'refresh')
     expect(ran.text).toContain('Hourly request budget used')
     expect(calls).toBe(0)
   })
@@ -111,13 +127,50 @@ describe('weather-theme', () => {
       urls.push(e.url)
       return { value: { status: 200, ok: true, headers: {}, text: reading(1000, 20) } }
     })
-    await $.command.run({ command: 'weather', args: 'add oslo' })
+    await weather($, 'add oslo')
     expect(urls.length).toBe(1)
     expect(urls[0]).toContain('location=oslo')
 
     expect(cached()).toContain('Oslo')
 
-    await $.command.run({ command: 'weather', args: 'remove oslo' })
+    await weather($, 'remove oslo')
     expect(cached()).not.toContain('Oslo')
+  })
+
+  test('decodes a PNG tile and round-trips base64', async () => {
+    const tile = decodePng(fromBase64(RED_TILE))
+    expect([tile.width, tile.height]).toEqual([256, 256])
+    expect(Array.from(tile.rgba.subarray(0, 8))).toEqual([200, 40, 40, 255, 200, 40, 40, 255])
+    expect(Array.from(tile.rgba.subarray(-4))).toEqual([200, 40, 40, 255])
+    expect(toBase64(fromBase64(RED_TILE))).toBe(RED_TILE)
+  })
+
+  test('/weather temp downloads four tiles and draws the map', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
+    const downloads: string[][] = []
+    on('process.run', async (_$, e) => {
+      downloads.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    const running = weather($, 'temp')
+    await clock.advance(5000)
+    expect((await running).text).toContain('Temperature now map updated')
+    expect(downloads.length).toBe(4)
+    expect(downloads[0]).toContain('https://api.tomorrow.io/v4/map/tile/1/0/0/temperature/now.png')
+    expect(downloads[0]).toContain('/home/test/.cache/claude-weather/temperature-1-0-0.png')
+
+    const pane = { ...PANE, props: { ...PANE.props, bodyColumns: 60 } }
+    const ui = await $.ui.mount({ plugin: 'weather-theme', surface: 'terminal', ...pane })
+    expect(await ui.find({ type: 'Raster' })).toBeDefined()
+    await ui.press({ key: 'pixels' })
+    expect(await ui.find({ type: 'Image' })).toBeDefined()
+    await ui.press({ key: 'view-cities' })
+    expect(await ui.find({ type: 'Image' })).toBeUndefined()
+    await ui.unmount()
   })
 })

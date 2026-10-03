@@ -16,12 +16,20 @@ export type Snapshot = {
   error: string | null
 }
 
+export type View = 'cities' | 'temperature' | 'precipitationIntensity'
+
 declare module 'claude-code' {
   interface PluginState {
     'weather-theme': {
       snapshot: Snapshot
       frame: number
       offset: number
+      view: View
+      // Bumped when a map's tiles change, so the pane redraws.
+      mapVersion: number
+      mapError: string | null
+      // Draw maps as pixels (kitty graphics) rather than half-block cells.
+      pixels: boolean
     }
   }
 }
