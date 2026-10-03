@@ -124,8 +124,12 @@ export function inflate(zlib: Uint8Array, size: number): Uint8Array {
     if (type === 0) {
       bits.align()
       const d = bits.data
+      if (bits.pos + 4 > d.length) throw new Error('inflate: out of input')
       const len = d[bits.pos]! | (d[bits.pos + 1]! << 8)
+      const nlen = d[bits.pos + 2]! | (d[bits.pos + 3]! << 8)
+      if ((len ^ 0xffff) !== nlen) throw new Error('inflate: bad stored block')
       bits.pos += 4
+      if (bits.pos + len > d.length) throw new Error('inflate: out of input')
       if (at + len > size) throw new Error('inflate: output overflow')
       out.set(d.subarray(bits.pos, bits.pos + len), at)
       bits.pos += len
@@ -142,14 +146,17 @@ export function inflate(zlib: Uint8Array, size: number): Uint8Array {
       } else if (sym === 256) break
       else {
         const l = sym - 257
+        if (l >= LEN_BASE.length) throw new Error('inflate: bad length code')
         const len = LEN_BASE[l]! + bits.read(LEN_EXTRA[l]!)
         const d = decodeSymbol(bits, dist)
+        if (d >= DIST_BASE.length) throw new Error('inflate: bad distance code')
         const back = DIST_BASE[d]! + bits.read(DIST_EXTRA[d]!)
-        if (back > at || at + len > size) throw new Error('inflate: bad distance')
+        if (!(back <= at && at + len <= size)) throw new Error('inflate: bad distance')
         for (let i = 0; i < len; i++, at++) out[at] = out[at - back]!
       }
     }
   }
+  if (at !== size) throw new Error('inflate: short output')
   return out
 }
 
@@ -180,6 +187,7 @@ export function decodePng(png: Uint8Array): Decoded {
         throw new Error(`png: unsupported format (depth ${depth}, color ${color})`)
       }
       channels = color === 6 ? 4 : 3
+      if (!width || !height || width > 4096 || height > 4096) throw new Error('png: bad size')
     } else if (type === 'IDAT') idat.push(data)
     else if (type === 'IEND') break
     i += 12 + len

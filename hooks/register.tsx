@@ -176,6 +176,11 @@ async function refresh($: $, force = false, only?: string): Promise<string> {
 type MapImage = { plain: Uint8Array; marked?: { key: string; b64: string }; cells?: { key: string; b64: string } }
 const maps = new Map<Field, MapImage>()
 let isFetchingTiles = false
+// A layer asked for while another was downloading; loaded when that ends.
+let pendingField: Field | undefined
+
+const TILE_RETRY_MS = 10 * 60 * 1000
+const TILE_SIZE = 256
 
 async function tilePath($: $, field: Field, x: number, y: number): Promise<string> {
   const home = (await $.env.get('HOME')) ?? '/tmp'
@@ -186,21 +191,50 @@ async function cityPixels($: $): Promise<[number, number][]> {
   return (await cities($)).map(c => cityPixel(c.query)).filter((p): p is [number, number] => p !== undefined)
 }
 
-// Downloads a layer's tiles when they are stale (curl, since $.http.fetch
-// answers text and tiles are PNG bytes), then decodes them into the map.
+function curlQuote(value: string): string {
+  return `"${value.replace(/[\\"]/g, c => `\\${c}`)}"`
+}
+
+// Downloads one tile to a temporary file and moves it into place, so a cut
+// download never replaces a good tile. curl reads its options from stdin,
+// keeping the API key off the command line; $.http.fetch answers text and
+// tiles are PNG bytes.
+async function downloadTile($: $, url: string, path: string): Promise<string | null> {
+  const partial = `${path}.part`
+  const config = [`url = ${curlQuote(url)}`, `output = ${curlQuote(partial)}`, 'write-out = "%{http_code}"', ''].join('\n')
+  const run = await $.process.run(['curl', '-s', '-f', '--create-dirs', '-K', '-'], { stdin: config, timeoutMs: 20_000 })
+  if (run.exitCode !== 0) {
+    const status = run.stdout.trim()
+    return status === '429'
+      ? 'Tomorrow.io rate limit hit; showing the last map.'
+      : status === '401' || status === '403'
+        ? 'Tomorrow.io rejected the API key.'
+        : `Map tile download failed (HTTP ${status || '–'}, curl ${run.exitCode}).`
+  }
+  const moved = await $.process.run(['mv', '-f', partial, path])
+  return moved.exitCode === 0 ? null : 'Could not save a map tile.'
+}
+
+// Downloads a layer's tiles when they are stale, then decodes them into the
+// map. A failed download is retried after TILE_RETRY_MS, not every check.
 async function loadMap($: $, field: Field, force = false): Promise<string> {
-  if (isFetchingTiles) return 'Already fetching map tiles.'
+  if (isFetchingTiles) {
+    pendingField = field
+    return 'Fetching another map first; this one follows.'
+  }
   const now = await $.clock.now()
   const key = await apiKey($)
   const stamps = ((await $.store.get('tilesAt')) ?? {}) as Partial<Record<Field, number>>
+  const failures = ((await $.store.get('tilesFailedAt')) ?? {}) as Partial<Record<Field, number>>
   const maxAge = key ? TILE_MAX_AGE_MS.keyed : TILE_MAX_AGE_MS.keyless
   const isFresh = !force && now - (stamps[field] ?? 0) < maxAge
-  if (isFresh && maps.has(field)) return 'Map is up to date.'
+  const isBackingOff = !force && now - (failures[field] ?? 0) < TILE_RETRY_MS
+  if ((isFresh || isBackingOff) && maps.has(field)) return 'Map is up to date.'
 
   isFetchingTiles = true
   let error: string | null = null
   try {
-    if (!isFresh) {
+    if (!isFresh && !isBackingOff) {
       for (const [i, [x, y]] of TILES.entries()) {
         const overBudget = await takeRequest($, now, Boolean(key))
         if (overBudget) {
@@ -210,34 +244,31 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
         if (i > 0) await wait($, REQUEST_GAP_MS)
         const auth = key ? `?apikey=${encodeURIComponent(key)}` : ''
         const url = `https://api.tomorrow.io/v4/map/tile/${ZOOM}/${x}/${y}/${field}/now.png${auth}`
-        const path = await tilePath($, field, x, y)
-        const run = await $.process.run(
-          ['curl', '-s', '-f', '--create-dirs', '-w', '%{http_code}', '-o', path, url],
-          { timeoutMs: 20_000 },
-        )
-        if (run.exitCode !== 0) {
-          const status = run.stdout.trim()
-          error =
-            status === '429'
-              ? 'Tomorrow.io rate limit hit; showing the last map.'
-              : status === '401' || status === '403'
-                ? 'Tomorrow.io rejected the API key.'
-                : `Map tile download failed (HTTP ${status || '–'}, curl ${run.exitCode}).`
-          break
-        }
+        error = await downloadTile($, url, await tilePath($, field, x, y))
+        if (error) break
       }
-      if (!error) await $.store.set('tilesAt', { ...stamps, [field]: now })
+      if (error) await $.store.set('tilesFailedAt', { ...failures, [field]: now })
+      else await $.store.set('tilesAt', { ...stamps, [field]: now })
     }
 
     const tiles = new Map<string, Decoded>()
+    let unreadable = 0
     for (const [x, y] of TILES) {
+      let base64: string
       try {
-        const { base64 } = await $.fs.read(await tilePath($, field, x, y), { as: 'bytes' })
-        tiles.set(`${x},${y}`, decodePng(fromBase64(base64)))
+        base64 = (await $.fs.read(await tilePath($, field, x, y), { as: 'bytes' })).base64
       } catch {
-        // A tile never downloaded leaves its quarter as bare land and sea.
+        continue // Never downloaded: its quarter stays bare land and sea.
+      }
+      try {
+        const tile = decodePng(fromBase64(base64))
+        if (tile.width !== TILE_SIZE || tile.height !== TILE_SIZE) throw new Error('png: unexpected size')
+        tiles.set(`${x},${y}`, tile)
+      } catch {
+        unreadable += 1
       }
     }
+    if (unreadable) error ??= `${unreadable} cached map tile(s) could not be read; refresh to fetch them again.`
     if (tiles.size === 0) {
       error ??= 'No map tiles yet.'
     } else {
@@ -248,6 +279,10 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
     await update($, mapError, () => error)
     await update($, mapVersion, n => n + 1)
   }
+
+  const next = pendingField
+  pendingField = undefined
+  if (next && next !== field && (await read($, view)) === next) await loadMap($, next)
   return error ?? `${layerOf(field).title} map updated.`
 }
 

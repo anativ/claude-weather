@@ -149,9 +149,9 @@ describe('weather-theme', () => {
     mock.store(on)
     mock.env(on, { HOME: '/home/test' })
     const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
-    const downloads: string[][] = []
+    const downloads: string[] = []
     on('process.run', async (_$, e) => {
-      downloads.push([...e.argv])
+      if (e.argv[0] === 'curl') downloads.push(e.init?.stdin ?? '')
       return { value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('fs.read', async () => ({ value: { base64: RED_TILE } }))
@@ -161,8 +161,8 @@ describe('weather-theme', () => {
     await clock.advance(5000)
     expect((await running).text).toContain('Temperature map updated')
     expect(downloads.length).toBe(4)
-    expect(downloads[0]).toContain('https://api.tomorrow.io/v4/map/tile/1/0/0/temperature/now.png')
-    expect(downloads[0]).toContain('/home/test/.cache/claude-weather/temperature-1-0-0.png')
+    expect(downloads[0]).toContain('url = "https://api.tomorrow.io/v4/map/tile/1/0/0/temperature/now.png"')
+    expect(downloads[0]).toContain('output = "/home/test/.cache/claude-weather/temperature-1-0-0.png.part"')
 
     const pane = { ...PANE, props: { ...PANE.props, bodyColumns: 60 } }
     const ui = await $.ui.mount({ plugin: 'weather-theme', surface: 'terminal', ...pane })
@@ -180,7 +180,7 @@ describe('weather-theme', () => {
     const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
     const urls: string[] = []
     on('process.run', async (_$, e) => {
-      urls.push(e.argv.find(a => a.startsWith('https://')) ?? '')
+      if (e.argv[0] === 'curl') urls.push(e.init?.stdin ?? '')
       return { value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('fs.read', async () => ({ value: { base64: RED_TILE } }))
@@ -200,5 +200,29 @@ describe('weather-theme', () => {
     expect(await ui.find({ type: 'Text', text: /Wind speed now/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /calm/ })).toBeDefined()
     await ui.unmount()
+  })
+
+  test('a failed tile download backs off instead of retrying each minute', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
+    let curls = 0
+    on('process.run', async (_$, e) => {
+      if (e.argv[0] === 'curl') curls += 1
+      return { value: { exitCode: 22, stdout: '500', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    expect((await weather($, 'wind')).text).toContain('HTTP 500')
+    expect(curls).toBe(1)
+    await clock.advance(2 * 60 * 1000)
+    expect((await weather($, 'wind')).text).toContain('up to date')
+    expect(curls).toBe(1)
+  })
+
+  test('inflate rejects a truncated stream', async () => {
+    const png = fromBase64(RED_TILE)
+    expect(() => decodePng(png.subarray(0, png.length - 40))).toThrow()
   })
 })
