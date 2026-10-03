@@ -6,7 +6,47 @@ import { toBase64 } from './base64'
 import type { Decoded } from './png'
 import { MASK_HEIGHT, MASK_SIZE, MASK_Y0, landMask } from './landmask'
 
-export type Field = 'temperature' | 'precipitationIntensity'
+// Tomorrow.io's map layers that answer without a key. `isOpaque` layers cover
+// every pixel, so the sea is dimmed to show the continents; the others are
+// blended over land and sea. `legend` runs from `low` to `high`, sampled
+// from the tiles' own palettes.
+export const LAYERS = [
+  { field: 'temperature', tab: 'temp', hotkey: '2', title: 'Temperature', isOpaque: true, low: 'cold', high: 'hot', legend: ['#3c64c8', '#3cc8c8', '#50c850', '#f0d040', '#e05030'] },
+  { field: 'precipitationIntensity', tab: 'precip', hotkey: '3', title: 'Precipitation', isOpaque: false, low: 'light', high: 'heavy', legend: ['#9fe0e0', '#40c000', '#f0e000', '#f08000', '#e02020'] },
+  { field: 'windSpeed', tab: 'wind', hotkey: '4', title: 'Wind speed', isOpaque: true, low: 'calm', high: 'strong', legend: ['#f0f0b0', '#a0d0a0', '#6080e0', '#4030a0', '#c040c0'] },
+  { field: 'windGust', tab: 'gusts', hotkey: '5', title: 'Wind gusts', isOpaque: true, low: 'calm', high: 'strong', legend: ['#f0f0c0', '#b0d8a8', '#7090e0', '#4838a8', '#c048c8'] },
+  { field: 'cloudCover', tab: 'clouds', hotkey: '6', title: 'Cloud cover', isOpaque: false, low: 'clear', high: 'overcast', legend: ['#101010', '#3060a0', '#80b0e0', '#d0e0f0', '#ffffff'] },
+  { field: 'humidity', tab: 'humidity', hotkey: '7', title: 'Humidity', isOpaque: true, low: 'dry', high: 'humid', legend: ['#fff0c0', '#e0a060', '#a05080', '#702878', '#401860'] },
+  { field: 'pressureSeaLevel', tab: 'pressure', hotkey: '8', title: 'Sea-level pressure', isOpaque: true, low: 'low', high: 'high', legend: ['#e0f0ff', '#80c060', '#c0d020', '#f0c000', '#f08000'] },
+  { field: 'uvIndex', tab: 'uv', hotkey: '9', title: 'UV index', isOpaque: false, low: 'low', high: 'extreme', legend: ['#0060ff', '#00c000', '#f0f000', '#f04000', '#e000e0'] },
+  { field: 'visibility', tab: 'visibility', hotkey: 'v', title: 'Visibility', isOpaque: false, low: 'poor', high: 'fair', legend: ['#c02030', '#e06040', '#f0a080', '#f0d0c0'] },
+  { field: 'dewPoint', tab: 'dew', hotkey: 'd', title: 'Dew point', isOpaque: true, low: 'low', high: 'high', legend: ['#3050c0', '#40b0c0', '#60d0a0', '#e0d060', '#f0a030'] },
+  { field: 'temperatureApparent', tab: 'feels', hotkey: 'f', title: 'Feels like', isOpaque: true, low: 'cold', high: 'hot', legend: ['#3c64c8', '#3cc8c8', '#50c850', '#f0d040', '#e05030'] },
+] as const
+
+export type Layer = (typeof LAYERS)[number]
+export type Field = Layer['field']
+
+export function layerOf(field: Field): Layer {
+  return LAYERS.find(l => l.field === field)!
+}
+
+// What `/weather <word>` and `/weather map <word>` accept for each layer.
+export function findLayer(word: string): Layer | undefined {
+  const w = word.toLowerCase()
+  const aliases: Record<string, Field> = {
+    map: 'temperature',
+    temperature: 'temperature',
+    rain: 'precipitationIntensity',
+    precipitation: 'precipitationIntensity',
+    gust: 'windGust',
+    cloud: 'cloudCover',
+    cloudcover: 'cloudCover',
+    feelslike: 'temperatureApparent',
+    dewpoint: 'dewPoint',
+  }
+  return LAYERS.find(l => l.tab === w || l.field.toLowerCase() === w || l.field === aliases[w])
+}
 
 export const MAP_WIDTH = MASK_SIZE
 export const MAP_HEIGHT = MASK_HEIGHT
@@ -60,11 +100,10 @@ export function cityPixel(query: string): [number, number] | undefined {
   return x >= 0 && x < MAP_WIDTH && y >= 0 && y < MAP_HEIGHT ? [x, y] : undefined
 }
 
-// Lays the field's tiles over the land mask: temperature is opaque, so the
-// sea is dimmed to show the continents; precipitation is translucent and
-// blends over land and sea. Coastlines are drawn over both.
+// Lays the field's tiles over the land mask, coastlines drawn over both.
 export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>): Uint8Array {
   const { land, coast: edge } = coast()
+  const layer = layerOf(field)
   const out = new Uint8Array(MAP_WIDTH * MAP_HEIGHT * 4)
   for (let y = 0; y < MAP_HEIGHT; y++) {
     const gy = y + MASK_Y0
@@ -76,13 +115,13 @@ export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>): Uint
       if (tile) {
         const t = (((gy & 255) * tile.width) + (x & 255)) * 4
         const a = tile.rgba[t + 3]! / 255
-        const k = field === 'temperature' && !isLand ? 0.6 : 1
+        const k = layer.isOpaque && !isLand ? 0.6 : 1
         r = r * (1 - a) + tile.rgba[t]! * a * k
         g = g * (1 - a) + tile.rgba[t + 1]! * a * k
         b = b * (1 - a) + tile.rgba[t + 2]! * a * k
       }
       if (edge[i]) {
-        const [er, eg, eb, ea] = field === 'temperature' ? [0, 0, 0, 0.55] : [150, 150, 160, 0.7]
+        const [er, eg, eb, ea] = layer.isOpaque ? [0, 0, 0, 0.55] : [150, 150, 160, 0.7]
         r = r * (1 - ea) + er * ea
         g = g * (1 - ea) + eg * ea
         b = b * (1 - ea) + eb * ea

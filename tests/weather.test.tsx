@@ -159,7 +159,7 @@ describe('weather-theme', () => {
 
     const running = weather($, 'temp')
     await clock.advance(5000)
-    expect((await running).text).toContain('Temperature now map updated')
+    expect((await running).text).toContain('Temperature map updated')
     expect(downloads.length).toBe(4)
     expect(downloads[0]).toContain('https://api.tomorrow.io/v4/map/tile/1/0/0/temperature/now.png')
     expect(downloads[0]).toContain('/home/test/.cache/claude-weather/temperature-1-0-0.png')
@@ -171,6 +171,34 @@ describe('weather-theme', () => {
     expect(await ui.find({ type: 'Image' })).toBeDefined()
     await ui.press({ key: 'view-cities' })
     expect(await ui.find({ type: 'Image' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('every layer has a command, and /weather wind loads wind tiles', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12) })
+    const urls: string[] = []
+    on('process.run', async (_$, e) => {
+      urls.push(e.argv.find(a => a.startsWith('https://')) ?? '')
+      return { value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    const listed = (await weather($, 'layers')).text
+    for (const word of ['temp', 'precip', 'wind', 'gusts', 'clouds', 'humidity', 'pressure', 'uv', 'visibility', 'dew', 'feels']) {
+      expect(listed).toContain(word)
+    }
+
+    const running = weather($, 'map wind')
+    await clock.advance(5000)
+    expect((await running).text).toContain('Wind speed map updated')
+    expect(urls.every(u => u.includes('/windSpeed/now.png'))).toBe(true)
+
+    const ui = await $.ui.mount({ plugin: 'weather-theme', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: /Wind speed now/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /calm/ })).toBeDefined()
     await ui.unmount()
   })
 })

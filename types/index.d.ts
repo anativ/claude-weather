@@ -16,7 +16,19 @@ export type Snapshot = {
   error: string | null
 }
 
-export type View = 'cities' | 'temperature' | 'precipitationIntensity'
+export type View =
+  | 'cities'
+  | 'temperature'
+  | 'precipitationIntensity'
+  | 'windSpeed'
+  | 'windGust'
+  | 'cloudCover'
+  | 'humidity'
+  | 'pressureSeaLevel'
+  | 'uvIndex'
+  | 'visibility'
+  | 'dewPoint'
+  | 'temperatureApparent'
 
 declare module 'claude-code' {
   interface PluginState {

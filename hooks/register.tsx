@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { City, CityWeather, Snapshot, View } from '../types'
 import { HEIGHT, WIDTH, describe, scene, tempColor } from './art'
-import { MAP_HEIGHT, MAP_WIDTH, TILES, ZOOM, cityPixel, compose, toCells, withMarkers } from './map'
+import { LAYERS, MAP_HEIGHT, MAP_WIDTH, TILES, ZOOM, cityPixel, compose, findLayer, layerOf, toCells, withMarkers } from './map'
 import type { Field } from './map'
 import { fromBase64, toBase64 } from './base64'
 import { decodePng } from './png'
@@ -50,10 +50,6 @@ const mapVersion = atom({ plugin: 'weather-theme', key: 'mapVersion' } as const,
 const mapError = atom({ plugin: 'weather-theme', key: 'mapError' } as const, null as string | null)
 const pixels = atom({ plugin: 'weather-theme', key: 'pixels' } as const, false)
 
-const MAP_TITLES: Record<Field, string> = {
-  temperature: 'Temperature now',
-  precipitationIntensity: 'Precipitation now',
-}
 
 type $ = EngineInterface
 
@@ -252,7 +248,7 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
     await update($, mapError, () => error)
     await update($, mapVersion, n => n + 1)
   }
-  return error ?? `${MAP_TITLES[field]} map updated.`
+  return error ?? `${layerOf(field).title} map updated.`
 }
 
 async function showView($: $, next: View) {
@@ -292,7 +288,9 @@ const HELP = [
   '/weather list            list cities',
   '/weather reset           back to the default cities',
   '/weather refresh         fetch now (uses API quota)',
-  '/weather temp | precip   show the world temperature or precipitation map',
+  '/weather <layer>         show a world map: temp precip wind gusts clouds',
+  '                         humidity pressure uv visibility dew feels',
+  '/weather layers          list the map layers',
   '/weather cities          back to the city view',
 ].join('\n')
 
@@ -412,23 +410,20 @@ export const register: Register = on => {
         return { text: `Back to the default cities. ${await refresh($, true)}` }
       case 'refresh':
         return { text: await refresh($, true) }
-      case 'temp':
-      case 'temperature':
-      case 'precip':
-      case 'precipitation':
-      case 'rain':
-      case 'map': {
-        const field: Field = sub.startsWith('temp') || sub === 'map' ? 'temperature' : 'precipitationIntensity'
-        await openPane($)
-        await update($, view, () => field)
-        return { text: await loadMap($, field) }
-      }
+      case 'layers':
+        return { text: LAYERS.map(l => `${l.tab.padEnd(11)} ${l.title}  (key ${l.hotkey})`).join('\n') }
       case 'cities':
         await update($, view, () => 'cities')
         await openPane($)
         return { text: 'City view.' }
-      default:
-        return { text: HELP }
+      default: {
+        // `/weather wind` or `/weather map wind`
+        const layer = findLayer(sub === 'map' ? arg || 'temp' : sub)
+        if (!layer) return { text: HELP }
+        await openPane($)
+        await update($, view, () => layer.field)
+        return { text: await loadMap($, layer.field) }
+      }
     }
   })
 
@@ -436,24 +431,20 @@ export const register: Register = on => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const current = await read($, view)
 
+    const views: [View, string, string][] = [
+      ['cities', 'cities', '1'],
+      ...LAYERS.map((l): [View, string, string] => [l.field, l.tab, l.hotkey]),
+    ]
     const tabs = (
-      <Box>
-        {(
-          [
-            ['cities', 'cities', '1'],
-            ['temperature', 'temp', '2'],
-            ['precipitationIntensity', 'precip', '3'],
-          ] as const
-        ).map(([id, label, hotkey]) => (
-          <Box marginRight={1}>
-            <Button
-              key={`view-${id}`}
-              label={label}
-              hotkey={hotkey}
-              variant={current === id ? 'primary' : 'secondary'}
-              onPress={() => void showView($, id)}
-            />
-          </Box>
+      <Box flexWrap="wrap" columnGap={1}>
+        {views.map(([id, label, hotkey]) => (
+          <Button
+            key={`view-${id}`}
+            label={label}
+            hotkey={hotkey}
+            variant={current === id ? 'primary' : 'secondary'}
+            onPress={() => void showView($, id)}
+          />
         ))}
         <Button key="refresh" label="refresh" hotkey="r" onPress={() => void refreshView($)} />
       </Box>
@@ -470,7 +461,7 @@ export const register: Register = on => {
       const markers = await cityPixels($)
       const markerKey = JSON.stringify(markers)
 
-      let picture = <Text dimColor>{error ?? `Loading ${MAP_TITLES[current].toLowerCase()} map…`}</Text>
+      let picture = <Text dimColor>{error ?? `Loading ${layerOf(current).title.toLowerCase()} map…`}</Text>
       if (image && e.surface !== 'terminal') {
         picture = <Text dimColor>Maps draw in the terminal.</Text>
       } else if (image && e.surface === 'terminal') {
@@ -484,7 +475,7 @@ export const register: Register = on => {
               source={{ rgba: image.marked.b64, width: MAP_WIDTH, height: MAP_HEIGHT }}
               columns={columns}
               rows={rows}
-              alt={`${MAP_TITLES[current]} (this terminal shows no images: press b for blocks)`}
+              alt={`${layerOf(current).title} (this terminal shows no images: press b for blocks)`}
             />
           )
         } else {
@@ -494,22 +485,19 @@ export const register: Register = on => {
         }
       }
 
-      const legend: [string, string][] =
-        current === 'temperature'
-          ? [['#3c64c8', '■'], ['#3cc8c8', '■'], ['#50c850', '■'], ['#f0d040', '■'], ['#e05030', '■']]
-          : [['#9fe0e0', '■'], ['#40c000', '■'], ['#f0e000', '■'], ['#f08000', '■'], ['#e02020', '■']]
+      const layer = layerOf(current)
 
       return (
         <Box flexDirection="column">
           {tabs}
-          <Text bold>{MAP_TITLES[current]}</Text>
+          <Text bold>{layerOf(current).title} now</Text>
           {picture}
           <Box>
-            <Text dimColor>{current === 'temperature' ? 'cold ' : 'light '}</Text>
-            {legend.map(([color, glyph]) => (
-              <Text color={color}>{glyph}</Text>
+            <Text dimColor>{layer.low} </Text>
+            {layer.legend.map(color => (
+              <Text color={color}>■</Text>
             ))}
-            <Text dimColor>{current === 'temperature' ? ' hot' : ' heavy'}</Text>
+            <Text dimColor> {layer.high}</Text>
             <Text dimColor> · tiles {clock(stamps[current] ?? 0)} · © Tomorrow.io, Natural Earth </Text>
             {e.surface === 'terminal' && (
               <Button key="pixels" label={usePixels ? 'blocks' : 'pixels'} hotkey="b" onPress={() => void togglePixels($)} />
