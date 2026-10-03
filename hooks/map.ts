@@ -101,7 +101,10 @@ export function cityPixel(query: string): [number, number] | undefined {
 }
 
 // Lays the field's tiles over the land mask, coastlines drawn over both.
-export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>): Uint8Array {
+// Zoom 1 tiles map pixel for pixel; a zoom 0 tile (the whole world in one,
+// what the forecast animation uses) is doubled.
+export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>, zoom: 0 | 1 = ZOOM): Uint8Array {
+  const shift = ZOOM - zoom
   const { land, coast: edge } = coast()
   const layer = layerOf(field)
   const out = new Uint8Array(MAP_WIDTH * MAP_HEIGHT * 4)
@@ -110,10 +113,12 @@ export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>): Uint
     for (let x = 0; x < MAP_WIDTH; x++) {
       const i = y * MAP_WIDTH + x
       const isLand = land[i] === 1
-      const tile = tiles.get(`${x >> 8},${gy >> 8}`)
+      const zx = x >> shift
+      const zy = gy >> shift
+      const tile = tiles.get(`${zx >> 8},${zy >> 8}`)
       let [r, g, b] = isLand ? LAND : WATER
       if (tile) {
-        const t = (((gy & 255) * tile.width) + (x & 255)) * 4
+        const t = (((zy & 255) * tile.width) + (zx & 255)) * 4
         const a = tile.rgba[t + 3]! / 255
         const k = layer.isOpaque && !isLand ? 0.6 : 1
         r = r * (1 - a) + tile.rgba[t]! * a * k
@@ -132,6 +137,13 @@ export function compose(field: Field, tiles: ReadonlyMap<string, Decoded>): Uint
       out[i * 4 + 3] = 255
     }
   }
+  return out
+}
+
+// A frame `t` of the way from `a` to `b`.
+export function blend(a: Uint8Array, b: Uint8Array, t: number): Uint8Array {
+  const out = new Uint8Array(a.length)
+  for (let i = 0; i < a.length; i++) out[i] = a[i]! + (b[i]! - a[i]!) * t
   return out
 }
 

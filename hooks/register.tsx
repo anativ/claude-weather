@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { City, CityWeather, Snapshot, View } from '../types'
 import { HEIGHT, WIDTH, describe, scene, tempColor } from './art'
-import { LAYERS, MAP_HEIGHT, MAP_WIDTH, TILES, ZOOM, cityPixel, compose, findLayer, layerOf, toCells, withMarkers } from './map'
+import { LAYERS, MAP_HEIGHT, MAP_WIDTH, TILES, ZOOM, blend, cityPixel, compose, findLayer, layerOf, toCells, withMarkers } from './map'
 import type { Field } from './map'
 import { fromBase64, toBase64 } from './base64'
 import { decodePng } from './png'
@@ -49,6 +49,17 @@ const view = atom({ plugin: 'weather-theme', key: 'view' } as const, 'cities' as
 const mapVersion = atom({ plugin: 'weather-theme', key: 'mapVersion' } as const, 0)
 const mapError = atom({ plugin: 'weather-theme', key: 'mapError' } as const, null as string | null)
 const pixels = atom({ plugin: 'weather-theme', key: 'pixels' } as const, false)
+const isPlaying = atom({ plugin: 'weather-theme', key: 'isPlaying' } as const, false)
+const playHour = atom({ plugin: 'weather-theme', key: 'playHour' } as const, 0)
+const playStatus = atom({ plugin: 'weather-theme', key: 'playStatus' } as const, null as string | null)
+
+// The forecast animation: one zoom 0 tile (the whole world) every
+// STEP_HOURS for HOURS, the hours between blended; 9 requests a layer.
+const HOURS = 24
+const STEP_HOURS = 3
+const KEYFRAMES = HOURS / STEP_HOURS + 1
+const PLAY_TICK_MS = 400
+const PLAY_HOLD_TICKS = 3
 
 
 type $ = EngineInterface
@@ -286,7 +297,147 @@ async function loadMap($: $, field: Field, force = false): Promise<string> {
   return error ?? `${layerOf(field).title} map updated.`
 }
 
+// Keyframes per layer, composited; `base` is the hour of the first.
+type Animation = { base: number; frames: Uint8Array[]; pixels: Map<string, string>; cells: Map<string, string> }
+const animations = new Map<Field, Animation>()
+let playTimer: { cancel: () => void } | undefined
+let playTicks = 0
+
+function frameTime(base: number, k: number): string {
+  return new Date(base + k * STEP_HOURS * HOUR_MS).toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+async function animPath($: $, field: Field, k: number): Promise<string> {
+  const home = (await $.env.get('HOME')) ?? '/tmp'
+  return `${home}/.cache/claude-weather/forecast/${field}-${k}.png`
+}
+
+// Downloads the layer's keyframes when the cached ones are stale, then
+// decodes and composites them. Plays whatever unbroken run loaded.
+async function loadAnimation($: $, field: Field): Promise<string | null> {
+  if (isFetchingTiles) return 'Fetching a map; try again in a moment.'
+  const now = await $.clock.now()
+  const key = await apiKey($)
+  const stamps = ((await $.store.get('forecastAt')) ?? {}) as Partial<Record<Field, { at: number; base: number }>>
+  const maxAge = key ? TILE_MAX_AGE_MS.keyed : TILE_MAX_AGE_MS.keyless
+  const stamp = stamps[field]
+  const isFresh = stamp !== undefined && now - stamp.at < maxAge
+  if (isFresh && animations.get(field)?.base === stamp.base) return null
+
+  isFetchingTiles = true
+  let error: string | null = null
+  try {
+    let base = stamp?.base ?? 0
+    // How many keyframes on disk belong to `base`; a partial download
+    // plays only the frames it fetched, never a mix of two forecasts.
+    let usable = KEYFRAMES
+    if (!isFresh) {
+      const fresh = Math.floor(now / HOUR_MS) * HOUR_MS
+      const auth = key ? `?apikey=${encodeURIComponent(key)}` : ''
+      let downloaded = 0
+      for (let k = 0; k < KEYFRAMES; k++) {
+        await update($, playStatus, () => `Loading forecast ${k + 1}/${KEYFRAMES}…`)
+        const overBudget = await takeRequest($, now, Boolean(key))
+        if (overBudget) {
+          error = overBudget
+          break
+        }
+        if (k > 0) await wait($, REQUEST_GAP_MS)
+        const url = `https://api.tomorrow.io/v4/map/tile/0/0/0/${field}/${frameTime(fresh, k)}.png${auth}`
+        error = await downloadTile($, url, await animPath($, field, k))
+        if (error) break
+        downloaded += 1
+      }
+      if (downloaded > 0) {
+        base = fresh
+        usable = downloaded
+      }
+      if (!error) await $.store.set('forecastAt', { ...stamps, [field]: { at: now, base } })
+    }
+
+    const frames: Uint8Array[] = []
+    for (let k = 0; k < usable; k++) {
+      try {
+        const { base64 } = await $.fs.read(await animPath($, field, k), { as: 'bytes' })
+        const tile = decodePng(fromBase64(base64))
+        if (tile.width !== TILE_SIZE || tile.height !== TILE_SIZE) break
+        frames.push(compose(field, new Map([['0,0', tile]]), 0))
+      } catch {
+        break
+      }
+    }
+    if (frames.length < 2) error ??= 'No forecast frames yet.'
+    else animations.set(field, { base, frames, pixels: new Map(), cells: new Map() })
+  } finally {
+    isFetchingTiles = false
+    await update($, playStatus, () => error)
+  }
+  return error
+}
+
+function frames(field: Field): number {
+  return animations.get(field)?.frames.length ?? 0
+}
+
+// The hours the loaded keyframes cover.
+function lastHour(field: Field): number {
+  return Math.max(0, (frames(field) - 1) * STEP_HOURS)
+}
+
+// The map `hour` hours ahead, blended between the keyframes either side.
+function frameAt(anim: Animation, hour: number): Uint8Array {
+  const k = Math.floor(hour / STEP_HOURS)
+  const t = (hour % STEP_HOURS) / STEP_HOURS
+  const a = anim.frames[k]!
+  const b = anim.frames[k + 1]
+  return t === 0 || !b ? a : blend(a, b, t)
+}
+
+async function advancePlay($: $) {
+  const current = await read($, view)
+  if (current === 'cities') return stopPlay($)
+  playTicks = (playTicks + 1) % (lastHour(current) + 1 + PLAY_HOLD_TICKS)
+  await update($, playHour, () => Math.min(playTicks, lastHour(current)))
+}
+
+async function startPlay($: $, field: Field): Promise<string> {
+  stopTimer()
+  await update($, view, () => field)
+  const error = await loadAnimation($, field)
+  if (frames(field) < 2) return error ?? 'No forecast frames.'
+  playTicks = Math.min(await read($, playHour), lastHour(field))
+  await update($, isPlaying, () => true)
+  playTimer = $.clock.every(PLAY_TICK_MS, () => void advancePlay($))
+  const playing = `Playing the next ${lastHour(field)} hours of ${layerOf(field).title.toLowerCase()}.`
+  return error ? `${playing} (${error})` : playing
+}
+
+function stopTimer() {
+  playTimer?.cancel()
+  playTimer = undefined
+}
+
+async function stopPlay($: $) {
+  stopTimer()
+  await update($, isPlaying, () => false)
+}
+
+async function togglePlay($: $) {
+  const current = await read($, view)
+  if (current === 'cities') return
+  if (await read($, isPlaying)) await stopPlay($)
+  else await startPlay($, current)
+}
+
+// Back to the live map.
+async function showNow($: $) {
+  await stopPlay($)
+  playTicks = 0
+  await update($, playHour, () => 0)
+}
+
 async function showView($: $, next: View) {
+  await showNow($)
   await update($, view, () => next)
   if (next !== 'cities') await loadMap($, next)
 }
@@ -326,6 +477,8 @@ const HELP = [
   '/weather <layer>         show a world map: temp precip wind gusts clouds',
   '                         humidity pressure uv visibility dew feels',
   '/weather layers          list the map layers',
+  '/weather play [layer]    animate the next 24 hours (9 requests a layer)',
+  '/weather stop            stop and go back to the live map',
   '/weather cities          back to the city view',
 ].join('\n')
 
@@ -362,6 +515,9 @@ async function openPane($: $) {
 }
 
 async function start($: $) {
+  // A reload drops the play timer; start from the live map.
+  await update($, isPlaying, () => false)
+  await update($, playHour, () => 0)
   // Ghostty, kitty and WezTerm draw real pixels; others get half-blocks.
   const term = ((await $.env.get('TERM_PROGRAM')) ?? '').toLowerCase()
   await update($, pixels, () => ['ghostty', 'kitty', 'wezterm'].includes(term))
@@ -391,7 +547,10 @@ export const register: Register = on => {
   })
 
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) stopTicker()
+    if (e.id === PANE) {
+      stopTicker()
+      stopTimer()
+    }
     return next(e)
   })
 
@@ -447,7 +606,18 @@ export const register: Register = on => {
         return { text: await refresh($, true) }
       case 'layers':
         return { text: LAYERS.map(l => `${l.tab.padEnd(11)} ${l.title}  (key ${l.hotkey})`).join('\n') }
+      case 'play': {
+        const current = await read($, view)
+        const layer = arg ? findLayer(arg) : current === 'cities' ? findLayer('precip') : layerOf(current)
+        if (!layer) return { text: `No layer "${arg}". /weather layers lists them.` }
+        await openPane($)
+        return { text: await startPlay($, layer.field) }
+      }
+      case 'stop':
+        await showNow($)
+        return { text: 'Back to the live map.' }
       case 'cities':
+        await showNow($)
         await update($, view, () => 'cities')
         await openPane($)
         return { text: 'City view.' }
@@ -456,6 +626,7 @@ export const register: Register = on => {
         const layer = findLayer(sub === 'map' ? arg || 'temp' : sub)
         if (!layer) return { text: HELP }
         await openPane($)
+        await showNow($)
         await update($, view, () => layer.field)
         return { text: await loadMap($, layer.field) }
       }
@@ -489,43 +660,77 @@ export const register: Register = on => {
       await read($, mapVersion)
       const error = await read($, mapError)
       const usePixels = await read($, pixels)
+      const hour = await read($, playHour)
+      const playing = await read($, isPlaying)
+      const status = await read($, playStatus)
+      const layer = layerOf(current)
       const image = maps.get(current)
+      const anim = animations.get(current)
+      const isForecast = anim !== undefined && (playing || hour > 0)
       const columns = Math.max(20, Math.min(e.props.bodyColumns, 160))
       const rows = Math.max(5, Math.round((columns * MAP_HEIGHT) / MAP_WIDTH / 2))
       const stamps = ((await $.store.get('tilesAt')) ?? {}) as Partial<Record<Field, number>>
       const markers = await cityPixels($)
       const markerKey = JSON.stringify(markers)
 
-      let picture = <Text dimColor>{error ?? `Loading ${layerOf(current).title.toLowerCase()} map…`}</Text>
-      if (image && e.surface !== 'terminal') {
+      let picture = <Text dimColor>{error ?? `Loading ${layer.title.toLowerCase()} map…`}</Text>
+      if ((image || isForecast) && e.surface !== 'terminal') {
         picture = <Text dimColor>Maps draw in the terminal.</Text>
-      } else if (image && e.surface === 'terminal') {
+      } else if ((image || isForecast) && e.surface === 'terminal') {
         const { Image, Raster } = $.ui.resolve(e)
-        if (usePixels) {
-          if (image.marked?.key !== markerKey) {
-            image.marked = { key: markerKey, b64: toBase64(withMarkers(image.plain, markers)) }
+        let pixelsB64: () => string
+        let cellsB64: () => string
+        if (anim && isForecast) {
+          const cache = (store: Map<string, string>, key: string, make: () => string) => {
+            if (store.size > 60) store.clear()
+            let value = store.get(key)
+            if (value === undefined) store.set(key, (value = make()))
+            return value
           }
-          picture = (
-            <Image
-              source={{ rgba: image.marked.b64, width: MAP_WIDTH, height: MAP_HEIGHT }}
-              columns={columns}
-              rows={rows}
-              alt={`${layerOf(current).title} (this terminal shows no images: press b for blocks)`}
-            />
-          )
+          pixelsB64 = () => cache(anim.pixels, `${hour}:${markerKey}`, () => toBase64(withMarkers(frameAt(anim, hour), markers)))
+          cellsB64 = () =>
+            cache(anim.cells, `${hour}:${columns}x${rows}:${markerKey}`, () => toCells(frameAt(anim, hour), columns, rows, markers))
         } else {
-          const key = `${columns}x${rows}:${markerKey}`
-          if (image.cells?.key !== key) image.cells = { key, b64: toCells(image.plain, columns, rows, markers) }
-          picture = <Raster key="map" columns={columns} rows={rows} cells={image.cells.b64} />
+          const still = image!
+          pixelsB64 = () => {
+            if (still.marked?.key !== markerKey) still.marked = { key: markerKey, b64: toBase64(withMarkers(still.plain, markers)) }
+            return still.marked.b64
+          }
+          cellsB64 = () => {
+            const key = `${columns}x${rows}:${markerKey}`
+            if (still.cells?.key !== key) still.cells = { key, b64: toCells(still.plain, columns, rows, markers) }
+            return still.cells.b64
+          }
         }
+        picture = usePixels ? (
+          <Image
+            key="map"
+            source={{ rgba: pixelsB64(), width: MAP_WIDTH, height: MAP_HEIGHT }}
+            columns={columns}
+            rows={rows}
+            alt={`${layer.title} (this terminal shows no images: press b for blocks)`}
+          />
+        ) : (
+          <Raster key="map" columns={columns} rows={rows} cells={cellsB64()} />
+        )
       }
 
-      const layer = layerOf(current)
+      let when = 'now'
+      if (anim && isForecast && hour > 0) {
+        const at = new Date(anim.base + hour * HOUR_MS)
+        const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][at.getDay()]
+        when = `${day} ${String(at.getHours()).padStart(2, '0')}:00 (+${hour}h)`
+      }
+      const span = anim ? lastHour(current) : HOURS
+      const timeline = '━'.repeat(Math.min(hour, span)) + '●' + '─'.repeat(Math.max(0, span - hour))
 
       return (
         <Box flexDirection="column">
           {tabs}
-          <Text bold>{layerOf(current).title} now</Text>
+          <Text bold>
+            {layer.title} {isForecast ? '· ' : ''}
+            {when}
+          </Text>
           {picture}
           <Box>
             <Text dimColor>{layer.low} </Text>
@@ -533,10 +738,20 @@ export const register: Register = on => {
               <Text color={color}>■</Text>
             ))}
             <Text dimColor> {layer.high}</Text>
-            <Text dimColor> · tiles {clock(stamps[current] ?? 0)} · © Tomorrow.io, Natural Earth </Text>
+            <Text dimColor>
+              {' '}· {isForecast ? 'forecast' : `tiles ${clock(stamps[current] ?? 0)}`} · © Tomorrow.io, Natural Earth{' '}
+            </Text>
             {e.surface === 'terminal' && (
               <Button key="pixels" label={usePixels ? 'blocks' : 'pixels'} hotkey="b" onPress={() => void togglePixels($)} />
             )}
+          </Box>
+          <Box columnGap={1}>
+            <Button key="play" label={playing ? '❚❚ pause' : '▶ play 24h'} hotkey="p" onPress={() => void togglePlay($)} />
+            {(playing || hour > 0) && <Button key="now" label="now" hotkey="o" onPress={() => void showNow($)} />}
+            <Text color={isForecast ? '#87afd7' : undefined} dimColor={!isForecast}>
+              {timeline}
+            </Text>
+            {status && <Text dimColor>{status}</Text>}
           </Box>
           {image && error && <Text color="#ff875f">{error}</Text>}
         </Box>

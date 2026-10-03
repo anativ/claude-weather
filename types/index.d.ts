@@ -42,6 +42,11 @@ declare module 'claude-code' {
       mapError: string | null
       // Draw maps as pixels (kitty graphics) rather than half-block cells.
       pixels: boolean
+      // The forecast animation: whether it plays, the hour shown (0 = now),
+      // and its loading progress or failure.
+      isPlaying: boolean
+      playHour: number
+      playStatus: string | null
     }
   }
 }

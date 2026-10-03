@@ -225,4 +225,39 @@ describe('weather-theme', () => {
     const png = fromBase64(RED_TILE)
     expect(() => decodePng(png.subarray(0, png.length - 40))).toThrow()
   })
+
+  test('/weather play fetches 9 forecast frames and steps through 24 hours', async ($, on) => {
+    mock.store(on)
+    mock.env(on, { HOME: '/home/test' })
+    const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12, 25) })
+    const urls: string[] = []
+    on('process.run', async (_$, e) => {
+      if (e.argv[0] === 'curl') urls.push(e.init?.stdin ?? '')
+      return { value: { exitCode: 0, stdout: '200', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('fs.read', async () => ({ value: { base64: RED_TILE } }))
+    on('ui.open', async () => ({ value: { isPlaced: true as const } }))
+
+    const running = weather($, 'play precip')
+    await clock.advance(9 * 1000)
+    expect((await running).text).toContain('Playing the next 24 hours of precipitation')
+    expect(urls.length).toBe(9)
+    expect(urls[0]).toContain('/map/tile/0/0/0/precipitationIntensity/2026-10-03T12:00:00Z.png')
+    expect(urls[8]).toContain('/map/tile/0/0/0/precipitationIntensity/2026-10-04T12:00:00Z.png')
+
+    const ui = await $.ui.mount({ plugin: 'weather-theme', surface: 'terminal', ...PANE })
+    await clock.advance(3 * 400)
+    const title = async () => (await ui.find({ type: 'Text', text: /^Precipitation/ }))?.text ?? ''
+    expect(await title()).toMatch(/\(\+\d+h\)/)
+    expect(await ui.find({ type: 'Raster' })).toBeDefined()
+
+    await ui.press({ key: 'play' })
+    const paused = await title()
+    await clock.advance(5 * 400)
+    expect(await title()).toBe(paused)
+
+    await ui.press({ key: 'now' })
+    expect(await title()).toBe('Precipitation now')
+    await ui.unmount()
+  })
 })

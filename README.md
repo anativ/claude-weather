@@ -23,6 +23,9 @@ wind speed, wind gusts, cloud cover, humidity, sea-level pressure, UV index,
 visibility, dew point and feels-like temperature. Terminals with the kitty graphics protocol (Ghostty, kitty, WezTerm)
 draw them in real pixels; others in half-block cells. Press `b` to switch.
 
+Press `p` on any map to play the next 24 hours: forecast frames every 3 hours,
+blended into hourly steps, with a timeline under the map. `o` goes back to now.
+
 ## Install
 
 ```sh
@@ -42,11 +45,14 @@ The pane opens by itself on terminals 144+ columns wide; otherwise run `/weather
 | `/weather refresh` | fetch now |
 | `/weather <layer>` | a world map: `temp` `precip` `wind` `gusts` `clouds` `humidity` `pressure` `uv` `visibility` `dew` `feels` |
 | `/weather layers` | list the map layers and their keys |
+| `/weather play [layer]` | animate the next 24 hours (precipitation by default) |
+| `/weather stop` | back to the live map |
 | `/weather cities` | back to the city view |
 | `/weather key <KEY>` | optional Tomorrow.io API key |
 
 Pane keys: `1` cities, `2`–`9` `v` `d` `f` map layers (see `/weather layers`),
-`r` refresh, `p` / `n` previous / next city, `b` pixels / blocks.
+`r` refresh, `p` / `n` previous / next city, `b` pixels / blocks;
+on a map `p` play / pause and `o` back to now.
 
 ## API key and rate limits
 
@@ -59,6 +65,10 @@ while that layer is shown and at most every 3 hours keyless (hourly with a key).
 Flicking through every layer at once costs 44 requests, close to the keyless
 hourly cap; the mod stops at its cap and keeps the last maps. Air quality
 (`epaIndex`) needs a key and isn't offered.
+
+The 24-hour animation uses one zoom-0 tile (the whole world) per frame, every
+3 hours from the top of the hour: 9 requests a layer, cached like the maps.
+The hours between are blended locally.
 They're downloaded with `curl` to `~/.cache/claude-weather/`.
 
 The refresh interval spreads a daily budget (110 requests keyless, 400 with a
