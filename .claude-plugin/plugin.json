@@ -1,0 +1,6 @@
+{
+  "name": "weather-theme",
+  "version": "0.1.0",
+  "description": "Weather around the world in a pane, with animated ASCII art per Tomorrow.io weather code",
+  "types": "./types/index.d.ts"
+}
